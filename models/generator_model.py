@@ -1,57 +1,7 @@
 import torch
 import torch.nn.functional as F
 import torch.nn as nn
-
-
-class DownSampleBlock(nn.Module):
-    """
-    Downsampling block for the U-Net generator.
-
-    Consists of Conv2d -> BatchNorm -> Activation -> Conv2d -> BatchNorm -> Activation
-    followed by a MaxPool2d for downsampling.
-
-    Args:
-        in_channel (int): Number of input channels.
-        out_channel (int): Number of output channels.
-        use_batchnorm (bool): Whether to use batch normalization.
-        use_maxpool (bool): Whether to use max pooling for downsampling.
-                           If False, will use strided convolution instead.
-        activation (callable): Activation function for downsampling.
-    """
-    def __init__(self, in_channel, out_channel, use_batchnorm=True, use_maxpool=True, activation=nn.LeakyReLU()):
-        super(DownSampleBlock, self).__init__()
-
-        # First convolution block
-        self.conv1 = nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity()
-        self.activation1 = activation
-
-
-        # Second convolution block
-        self.conv2 = nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity()
-        self.activation2 = activation
-
-        # Downsampling
-        self.use_maxpool = use_maxpool
-        if use_maxpool:
-            self.downsample = nn.MaxPool2d(kernel_size=2, stride=2)
-        else:
-             # Strided convolution alternative for downsampling
-            self.downsample = nn.Conv2d(in_channel, out_channel, kernel_size=4, stride=2, padding=1)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.activation1(x)
-
-        x = self.conv2(x)
-        x = self.bn2(x)
-        features = self.activation2(x)
-
-        x_down = self.downsample(features)
-
-        return x_down, features
+from torchvision.models import resnet34, ResNet34_Weights
 
 
 class UpSampleBlock(nn.Module):
@@ -68,24 +18,35 @@ class UpSampleBlock(nn.Module):
                                  Options: 'nearest', 'bilinear', 'bicubic'.
         activation (callable): Activation function for upsampling.
     """
-    def __init__(self, in_channel, out_channel, use_batchnorm=True, interpolation_mode='bilinear', activation=nn.LeakyReLU()):
+    def __init__(self, in_channel, skip_in_channel, out_channel, number_of_convolutions=2, use_batchnorm=True, interpolation_mode='bilinear', activation=nn.LeakyReLU()):
         super(UpSampleBlock, self).__init__()
-
+        
         self.interpolation_mode = interpolation_mode
+        if interpolation_mode == 'conv':
+            self.transposed_conv = nn.ConvTranspose2d(in_channel, in_channel, kernel_size=4, stride=2, padding=1)
 
         # Convolution after upsampling
         self.conv1 = nn.Conv2d(in_channel, in_channel, kernel_size=3, stride=1, padding=1)
         self.bn1 = nn.BatchNorm2d(in_channel) if use_batchnorm else nn.Identity()
         self.activation1 = activation
 
+        self.skip_conv = nn.Conv2d(in_channel + skip_in_channel, out_channel, kernel_size=3, stride=1, padding=1)
+        self.skip_bn = nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity()
+        self.skip_activation = activation
+
+        self.number_of_convolutions = number_of_convolutions
+
         # Second convolution (after concatenation with skip connection)
-        self.conv2 = nn.Conv2d(in_channel * 2, out_channel, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity()
-        self.activation2 = activation
+        for i in range(number_of_convolutions):
+            setattr(self, f"conv{i+3}", nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=1, padding=1))
+            setattr(self, f"bn{i+3}", nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity())
+            setattr(self, f"activation{i+3}", activation)
 
     def forward(self, x, skip_features):
-        x = F.interpolate(x, scale_factor=2, mode=self.interpolation_mode, align_corners=False if self.interpolation_mode != 'nearest' else None)
-
+        if self.interpolation_mode == 'conv':
+            x = self.transposed_conv(x)
+        else:
+            x = F.interpolate(x, scale_factor=2, mode=self.interpolation_mode, align_corners=False if self.interpolation_mode != 'nearest' else None)
         # apply convolution after upsampling
         x = self.conv1(x)
         x = self.bn1(x)
@@ -94,10 +55,19 @@ class UpSampleBlock(nn.Module):
         # Concatenate with skip connection
         x = torch.cat([x, skip_features], dim=1)
 
-        # Apply second convolution
-        x = self.conv2(x)
-        x = self.bn2(x)
-        x = self.activation2(x)
+        x = self.skip_conv(x)
+        x = self.skip_bn(x)
+        x = self.skip_activation(x)
+
+        residual_x = x
+        # Apply convolutions with residual connections
+        for i in range(3, self.number_of_convolutions + 3):
+            x = getattr(self, f"conv{i}")(x)
+            x = getattr(self, f"bn{i}")(x)
+            x = getattr(self, f"activation{i}")(x)
+
+            x = x + residual_x # residual connection
+            residual_x = x
 
         return x
 
@@ -123,75 +93,60 @@ class UNetGenerator(nn.Module):
         activation (callable): Activation function for downsampling and upsampling.
         final_activation (callable): Activation function for the final layer.
     """
-    def __init__(self, in_channels=1, out_channels=3, init_features=64, depth=4, use_batchnorm=True, use_maxpool=True, interpolation_mode='bilinear', activation=nn.LeakyReLU(), final_activation=nn.Tanh()):
+    def __init__(self, in_channels=1, out_channels=3, use_batchnorm=True, use_maxpool=True, interpolation_mode='bilinear', activation=nn.LeakyReLU(), final_activation=nn.Tanh()):
         super(UNetGenerator, self).__init__()
 
-        self.depth = depth
-
+        self.interpolation_mode = interpolation_mode
         # Encoder (downsampling) path
-        self.down_blocks = nn.ModuleList()
-
-        # Initial block doesn't downsample
-        self.initial_conv = nn.Sequential(
-            nn.Conv2d(in_channels, init_features, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(init_features) if use_batchnorm else nn.Identity(),
-            activation,
-        )
-
-
-        # Downsample blocks
-        in_features = init_features
-        for i in range(depth):
-            out_features = in_features * 2
-            self.down_blocks.append(
-                DownSampleBlock(in_features, out_features, use_batchnorm, use_maxpool, activation)
-            )
-            in_features = out_features
+        self.encoder = resnet34(weights=ResNet34_Weights.DEFAULT)
 
         # Bottleneck
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(in_features, in_features, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(in_features) if use_batchnorm else nn.Identity(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(512) if use_batchnorm else nn.Identity(),
             activation,
-            nn.Conv2d(in_features, in_features, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(in_features) if use_batchnorm else nn.Identity(),
+            nn.Conv2d(512, 512, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(512) if use_batchnorm else nn.Identity(),
             activation,
         )
-
-        # Decoder (upsampling) path
-        self.up_blocks = nn.ModuleList()
-
-        for i in range(depth):
-            out_features = in_features // 2
-            self.up_blocks.append(
-                UpSampleBlock(in_features, out_features, use_batchnorm, interpolation_mode, activation)
-            )
-            in_features = out_features
+        self.d_layer1 = UpSampleBlock(512, 256, 256, number_of_convolutions=16, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.d_layer2 = UpSampleBlock(256, 128, 128, number_of_convolutions=12, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.d_layer3 = UpSampleBlock(128, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.d_layer4 = UpSampleBlock(64, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.d_layer5 = UpSampleBlock(64, 0, 64, number_of_convolutions=6, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
 
         # Final layer
-        self.final_conv = nn.Conv2d(in_features, out_channels, kernel_size=1)
+        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
 
         self.final_activation = final_activation
 
     def forward(self, x):
-        # Initial features
-        x = self.initial_conv(x)
-
         # Store skip connections
         skip_connections = []
-
+        x = x.repeat(1, 3, 1, 1)
         # Encoder path
-        for down_block in self.down_blocks:
-            x, features = down_block(x)
-            skip_connections.append(features)
+        x = self.encoder.conv1(x)    # 64, 32, 32
+        x = self.encoder.bn1(x)      # 64, 32, 32
+        x = self.encoder.relu(x)     # 64, 32, 32
+        skip_connections.append(x)
+        x = self.encoder.maxpool(x)  # 64, 16, 16
+        x = self.encoder.layer1(x)   # 64, 16, 16
+        skip_connections.append(x)
+        x = self.encoder.layer2(x)   # 128, 8, 8
+        skip_connections.append(x)
+        x = self.encoder.layer3(x)   # 256, 4, 4
+        skip_connections.append(x)
+        x = self.encoder.layer4(x)   # 512, 2, 2
 
         # Bottleneck
         x = self.bottleneck(x)
 
-        # Decoder path with skip connections (in reverse order)
-        for i, up_block in enumerate(self.up_blocks):
-            skip_features = skip_connections[-(i + 1)]
-            x = up_block(x, skip_features)
+        # Decoder path
+        x = self.d_layer1(x, skip_connections[3])
+        x = self.d_layer2(x, skip_connections[2])
+        x = self.d_layer3(x, skip_connections[1])
+        x = self.d_layer4(x, skip_connections[0])
+        x = self.d_layer5(x, torch.tensor([], device=x.device))
 
         # Final convolution and activation
         x = self.final_conv(x)
@@ -247,12 +202,28 @@ if __name__ == "__main__":
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     # For colorization task
-    model = UNetGenerator(in_channels=1, out_channels=3, depth=4, final_activation=nn.Tanh(), activation=nn.LeakyReLU())
+    model = UNetGenerator(in_channels=1, out_channels=3, final_activation=nn.Tanh(), activation=nn.LeakyReLU())
 
     # Print model structure
     print(model)
     print(f"Number of trainable parameters {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
+    # Encoder number of parameters
+    print(f"Encoder number of parameters: {sum(p.numel() for p in model.encoder.parameters()):,}")
+
+    # Bottleneck number of parameters
+    print(f"Bottleneck number of parameters: {sum(p.numel() for p in model.bottleneck.parameters()):,}")
+
+    # Decoder number of parameters
+    decoder_number_of_parameters = 0
+    decoder_number_of_parameters += sum(p.numel() for p in model.d_layer1.parameters())
+    decoder_number_of_parameters += sum(p.numel() for p in model.d_layer2.parameters())
+    decoder_number_of_parameters += sum(p.numel() for p in model.d_layer3.parameters())
+    decoder_number_of_parameters += sum(p.numel() for p in model.d_layer4.parameters())
+    decoder_number_of_parameters += sum(p.numel() for p in model.d_layer5.parameters())
+    decoder_number_of_parameters += sum(p.numel() for p in model.final_conv.parameters())
+    print(f"Decoder number of parameters: {decoder_number_of_parameters:,}")
+    
     # Check dimensions
     print_unet_dimensions()
 
