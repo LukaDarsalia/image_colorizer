@@ -18,7 +18,7 @@ class UpSampleBlock(nn.Module):
                                  Options: 'nearest', 'bilinear', 'bicubic'.
         activation (callable): Activation function for upsampling.
     """
-    def __init__(self, in_channel, skip_in_channel, out_channel, number_of_convolutions=2, use_batchnorm=True, interpolation_mode='bilinear', activation=nn.LeakyReLU()):
+    def __init__(self, in_channel, skip_in_channel, out_channel, number_of_convolutions=2, use_batchnorm=True, interpolation_mode='bilinear', activation=nn.LeakyReLU(), z_dim=None):
         super(UpSampleBlock, self).__init__()
         
         self.interpolation_mode = interpolation_mode
@@ -27,6 +27,8 @@ class UpSampleBlock(nn.Module):
 
         # Convolution after upsampling
         self.conv1 = nn.Conv2d(in_channel, in_channel, kernel_size=3, stride=1, padding=1)
+        if z_dim is not None:
+            self.film1 = FiLM(in_channel, z_dim)
         self.bn1 = nn.BatchNorm2d(in_channel) if use_batchnorm else nn.Identity()
         self.activation1 = activation
 
@@ -42,7 +44,7 @@ class UpSampleBlock(nn.Module):
             setattr(self, f"bn{i+3}", nn.BatchNorm2d(out_channel) if use_batchnorm else nn.Identity())
             setattr(self, f"activation{i+3}", activation)
 
-    def forward(self, x, skip_features):
+    def forward(self, x, skip_features, z=None):
         if self.interpolation_mode == 'conv':
             x = self.transposed_conv(x)
         else:
@@ -50,10 +52,13 @@ class UpSampleBlock(nn.Module):
         # apply convolution after upsampling
         x = self.conv1(x)
         x = self.bn1(x)
+        if z is not None:
+            x = self.film1(x, z)
         x = self.activation1(x)
 
         # Concatenate with skip connection
-        x = torch.cat([x, skip_features], dim=1)
+        if skip_features is not None:
+            x = torch.cat([x, skip_features], dim=1)
 
         x = self.skip_conv(x)
         x = self.skip_bn(x)
@@ -70,6 +75,24 @@ class UpSampleBlock(nn.Module):
             residual_x = x
 
         return x
+
+
+# ---- FiLM mod ----
+class FiLM(torch.nn.Module):
+    def __init__(self, in_channels, z_dim):
+        super().__init__()
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(z_dim, in_channels*2),
+            torch.nn.SiLU(),
+            torch.nn.Linear(in_channels*2, in_channels*2)
+        )
+    def forward(self, feat, z):
+        # feat: (B,C,H,W), z: (B,z_dim)
+        gamma_beta = self.mlp(z)                      # (B, 2C)
+        gamma, beta = gamma_beta.chunk(2, dim=1)      # (B,C), (B,C)
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1)     # (B,C,1,1)
+        beta  = beta.unsqueeze(-1).unsqueeze(-1)
+        return (1 + gamma) * feat + beta              # residual-friendly
 
 
 class UNetGenerator(nn.Module):
@@ -109,8 +132,9 @@ class UNetGenerator(nn.Module):
             nn.BatchNorm2d(512) if use_batchnorm else nn.Identity(),
             activation,
         )
-        self.d_layer1 = UpSampleBlock(512, 256, 256, number_of_convolutions=16, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
-        self.d_layer2 = UpSampleBlock(256, 128, 128, number_of_convolutions=12, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.bottleneck_film = FiLM(512, 128)
+        self.d_layer1 = UpSampleBlock(512, 256, 256, number_of_convolutions=16, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
+        self.d_layer2 = UpSampleBlock(256, 128, 128, number_of_convolutions=12, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
         self.d_layer3 = UpSampleBlock(128, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
         self.d_layer4 = UpSampleBlock(64, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
         self.d_layer5 = UpSampleBlock(64, 0, 64, number_of_convolutions=6, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
@@ -120,7 +144,7 @@ class UNetGenerator(nn.Module):
 
         self.final_activation = final_activation
 
-    def forward(self, x):
+    def forward(self, x, z):
         # Store skip connections
         skip_connections = []
         x = x.repeat(1, 3, 1, 1)
@@ -139,14 +163,16 @@ class UNetGenerator(nn.Module):
         x = self.encoder.layer4(x)   # 512, 2, 2
 
         # Bottleneck
+        if z is not None:
+            x = self.bottleneck_film(x, z)
         x = self.bottleneck(x)
 
         # Decoder path
-        x = self.d_layer1(x, skip_connections[3])
-        x = self.d_layer2(x, skip_connections[2])
+        x = self.d_layer1(x, skip_connections[3], z)
+        x = self.d_layer2(x, skip_connections[2], z)
         x = self.d_layer3(x, skip_connections[1])
         x = self.d_layer4(x, skip_connections[0])
-        x = self.d_layer5(x, torch.tensor([], device=x.device))
+        x = self.d_layer5(x, None)
 
         # Final convolution and activation
         x = self.final_conv(x)

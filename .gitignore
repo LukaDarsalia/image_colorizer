@@ -3,6 +3,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 logs_test
+logs_test_v2
 runs_on_big_data
 # C extensions
 *.so

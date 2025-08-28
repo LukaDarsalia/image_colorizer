@@ -10,6 +10,10 @@ class TBLogger:
         self.tb = SummaryWriter(log_dir)
         self.global_step = 0
 
+    def log_lambda(self, lambda_l1: float, lambda_mode_seeking: float):
+        self.tb.add_scalar("lambda/l1", lambda_l1, self.global_step)
+        self.tb.add_scalar("lambda/mode_seeking", lambda_mode_seeking, self.global_step)
+
     def log_lr(self, optimizer_g: torch.optim.Optimizer, optimizer_d: torch.optim.Optimizer):
         self.tb.add_scalar("lr/g", optimizer_g.param_groups[0]["lr"], self.global_step)
         self.tb.add_scalar("lr/d", optimizer_d.param_groups[0]["lr"], self.global_step)
@@ -26,7 +30,8 @@ class TBLogger:
             self.tb.add_scalar("val_loss/generator", validation_losses.generator_losses.g_loss, self.global_step)
             # log l1 loss
             self.tb.add_scalar("val_loss/l1", validation_losses.generator_losses.l1_loss, self.global_step)
-        
+            # log mode-seeking loss
+            self.tb.add_scalar("val_loss/mode_seeking", -validation_losses.generator_losses.mode_seeking_loss, self.global_step)
         # log discriminator loss
         self.tb.add_scalar("train_loss/discriminator", train_losses.discriminator_losses.d_loss, self.global_step)
         # log em loss
@@ -41,6 +46,8 @@ class TBLogger:
         self.tb.add_scalar("train_loss/generator_grad_norm", train_losses.generator_losses.grad_norm, self.global_step)
         # log generator l1 loss
         self.tb.add_scalar("train_loss/generator_l1", train_losses.generator_losses.l1_loss, self.global_step)
+        # log generator mode-seeking loss
+        self.tb.add_scalar("train_loss/generator_mode_seeking", -train_losses.generator_losses.mode_seeking_loss, self.global_step)
         # log generator g loss
         self.tb.add_scalar("train_loss/generator_g", train_losses.generator_losses.g_loss, self.global_step)
 
@@ -53,9 +60,10 @@ class TBLogger:
         self.tb.add_images("sample/generated", sample_generated_images, self.global_step)
         self.tb.add_images("sample/targets", sample_targets, self.global_step)
 
-    def log(self, global_step: int, optimizer_g: torch.optim.Optimizer, optimizer_d: torch.optim.Optimizer, model: torch.nn.Module, train_losses: TrainLosses, validation_losses: Optional[ValidationLosses]):
+    def log(self, global_step: int, optimizer_g: torch.optim.Optimizer, optimizer_d: torch.optim.Optimizer, model: torch.nn.Module, train_losses: TrainLosses, validation_losses: Optional[ValidationLosses], lambda_l1: float, lambda_mode_seeking: float):
         self.global_step = global_step
         self.log_lr(optimizer_g, optimizer_d)
+        self.log_lambda(lambda_l1, lambda_mode_seeking)
         self.log_losses(train_losses, validation_losses)
         if validation_losses is not None:
             # self.log_model(model, validation_losses.sample_original_images)
