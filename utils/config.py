@@ -19,12 +19,13 @@ class TrainingArgs:
     discriminator_beta2: float          # Discriminator beta2
     lambda_gp: float                    # Lambda GP
     lambda_l1: float                    # Lambda L1
-    lambda_l1_low: float                 # Lambda L1 Low
+    lambda_l1_low: float                # Lambda L1 Low
     lambda_mode_seeking: float          # Lambda Mode-Seeking
     lambda_mode_seeking_low: float      # Lambda Mode-Seeking Low
     critic_n: int                       # Number of critic updates per generator update
     val_freq: int                       # Number of validation in one epoch
     log_dir: str                        # Path to the log directory
+    accumulation_steps: int             # Number of accumulation steps
 
 @dataclasses.dataclass
 class DiscriminatorLosses:

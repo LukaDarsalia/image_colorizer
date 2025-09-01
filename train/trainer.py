@@ -11,7 +11,7 @@ from utils.metrics import PSNR, SSIM
 from utils.logging import TBLogger
 from tqdm import tqdm
 import math
-
+import os
 
 class CosineScalarScheduler:
     """
@@ -57,6 +57,7 @@ class MyTrainer:
         # Generator and discriminator learning rates
         self.generator_lr = args.generator_lr
         self.discriminator_lr = args.discriminator_lr
+        self.accumulation_steps = args.accumulation_steps
 
         # Generator and discriminator beta1 and beta2
         self.generator_beta1 = args.generator_beta1
@@ -75,6 +76,7 @@ class MyTrainer:
         self.generator = UNetGenerator(**self.generator__init__args).to(self.device)
         self.discriminator = PatchGAN70(**self.discriminator__init__args).to(self.device)
         self.critic_n = args.critic_n
+        self.original_critic_n = args.critic_n
 
         # Generator and discriminator optimizers
         self.generator_optimizer = torch.optim.Adam(self.generator.parameters(), lr=self.generator_lr, betas=(self.generator_beta1, self.generator_beta2))
@@ -84,10 +86,10 @@ class MyTrainer:
         self.train_loader, self.val_loader = get_dataloaders(self.data_path, batch_size=self.batch_size, image_size=self.image_size)
 
         # Generator and discriminator schedulers which works for each step
-        self.generator_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.generator_optimizer, T_max=self.epochs*len(self.train_loader), eta_min=self.generator_lr * 0.01)
-        self.discriminator_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.discriminator_optimizer, T_max=self.epochs*len(self.train_loader), eta_min=self.discriminator_lr * 0.01)
-        self.scheduler_l1 = CosineScalarScheduler(self.lambda_l1, self.lambda_l1_low, self.epochs*len(self.train_loader))
-        self.scheduler_mode_seeking = CosineScalarScheduler(self.lambda_mode_seeking, self.lambda_mode_seeking_low, self.epochs*len(self.train_loader))
+        self.generator_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.generator_optimizer, T_max=self.epochs*len(self.train_loader)//self.accumulation_steps, eta_min=self.generator_lr * 0.1)
+        self.discriminator_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(self.discriminator_optimizer, T_max=self.epochs*len(self.train_loader)*self.critic_n//self.accumulation_steps, eta_min=self.discriminator_lr * 0.1)
+        self.scheduler_l1 = CosineScalarScheduler(self.lambda_l1, self.lambda_l1_low, self.epochs*len(self.train_loader)//self.accumulation_steps)
+        self.scheduler_mode_seeking = CosineScalarScheduler(self.lambda_mode_seeking, self.lambda_mode_seeking_low, self.epochs*len(self.train_loader)//self.accumulation_steps)
 
         # Number of validation in one epoch
         self.val_freq = len(self.train_loader) // args.val_freq
@@ -95,7 +97,10 @@ class MyTrainer:
         # Tensorboard logger
         self.tb_logger = TBLogger(log_dir=args.log_dir)
 
-    def validate(self, batch_idx, end_of_epoch=False):
+        self.g_accumulation_count = 0
+        self.d_accumulation_count = 0
+
+    def validate(self, batch_idx):
         if (batch_idx % self.val_freq != 0) or batch_idx<self.val_freq:
             return None
         self.generator.eval()
@@ -123,7 +128,7 @@ class MyTrainer:
 
                 # Save sample images
                 if sample_generated_images is None:
-                    sample_generated_images = generated_images
+                    sample_generated_images = torch.cat([generated_images, generated_images_2], dim=0)
                 if sample_targets is None:
                     sample_targets = targets
                 if sample_original_images is None:
@@ -175,19 +180,30 @@ class MyTrainer:
         return validation_losses
     
     def log_step(self, global_step: int, train_losses: TrainLosses, validation_losses: ValidationLosses):
-        self.tb_logger.log(global_step, self.generator_optimizer, self.discriminator_optimizer, self.generator, train_losses, validation_losses, self.lambda_l1, self.lambda_mode_seeking)
+        self.tb_logger.log(global_step, self.generator_optimizer, self.discriminator_optimizer, self.generator, train_losses, validation_losses, self.lambda_l1, self.lambda_mode_seeking, self.critic_n)
+
+    def save_model(self, epoch):
+        os.makedirs('checkpoints', exist_ok=True)
+        torch.save(self.generator.state_dict(), f'checkpoints/generator_epoch_{epoch}.pth')
+        torch.save(self.discriminator.state_dict(), f'checkpoints/discriminator_epoch_{epoch}.pth')
+
+    def load_model(self, epoch):
+        self.generator.load_state_dict(torch.load(f'checkpoints/generator_epoch_{epoch}.pth'))
+        self.discriminator.load_state_dict(torch.load(f'checkpoints/discriminator_epoch_{epoch}.pth'))
 
     def train(self):
         for epoch in range(self.epochs):
             for batch_idx, batch in tqdm(enumerate(self.train_loader), total=len(self.train_loader), desc=f"Epoch {epoch+1}/{self.epochs}"):
+                global_step = epoch * len(self.train_loader) + batch_idx
+
+                if global_step % 500 == 0 or global_step < 25:
+                    self.critic_n = 100
+                else:
+                    self.critic_n = self.original_critic_n
                 train_losses = self.train_step(batch)
                 validation_losses = self.validate(batch_idx)
-                global_step = epoch * len(self.train_loader) + batch_idx
                 self.log_step(global_step, train_losses, validation_losses)
-                self.generator_scheduler.step()
-                self.discriminator_scheduler.step()
-                self.scheduler_l1.step(); self.lambda_l1 = self.scheduler_l1.get()
-                self.scheduler_mode_seeking.step(); self.lambda_mode_seeking = self.scheduler_mode_seeking.get()
+            self.save_model(epoch)
 
     def generate_z(self, batch_size, z_dim):
         return torch.randn(batch_size, z_dim, device=self.device)
@@ -226,11 +242,13 @@ class MyTrainer:
 
     def discriminator_step(self, input_images, real_images):
         # Zero out the gradients
-        self.discriminator_optimizer.zero_grad()
+        if self.d_accumulation_count == 0:
+            self.discriminator_optimizer.zero_grad()
 
         # Generate images
-        z = self.generate_z(input_images.shape[0], 128)
-        generated_images = self.generator(input_images, z)
+        with torch.no_grad():
+            z = self.generate_z(input_images.shape[0], 128)
+            generated_images = self.generator(input_images, z)
 
         # Concatenate input images with real and generated images
         conditioned_real_images = torch.cat([real_images, input_images], dim=1)
@@ -255,15 +273,21 @@ class MyTrainer:
 
         # Calculate total loss
         d_loss = em_loss + self.lambda_gp * gp_loss
+        d_loss = d_loss / self.accumulation_steps
+        self.d_accumulation_count += 1
 
         # Backpropagate
         d_loss.backward()
-        self.discriminator_optimizer.step()
+        if self.d_accumulation_count >= self.accumulation_steps:
+            self.discriminator_optimizer.step()
+            self.discriminator_scheduler.step()
+            self.d_accumulation_count = 0
         # Log the losses
         return DiscriminatorLosses(d_loss=d_loss, em_loss=em_loss, gp_loss=gp_loss, grad_norm=grad_norm, distance=distance)
 
     def generator_step(self, input_images, real_images):
-        self.generator_optimizer.zero_grad()
+        if self.g_accumulation_count == 0:
+            self.generator_optimizer.zero_grad()
 
         z = self.generate_z(input_images.shape[0], 128)
         generated_images = self.generator(input_images, z)
@@ -281,8 +305,9 @@ class MyTrainer:
         mode_seeking_loss = -(num / denom)
 
         g_loss = -generated_preds.mean() + self.lambda_l1 * l1_loss + self.lambda_mode_seeking * mode_seeking_loss
-
+        g_loss = g_loss / self.accumulation_steps
         g_loss.backward()
+        self.g_accumulation_count += 1
         # Compute total grad norm
         total_norm = 0
         for p in self.generator.parameters():
@@ -290,12 +315,21 @@ class MyTrainer:
                 param_norm = p.grad.data.norm(2)  # ||grad||_2
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
-        self.generator_optimizer.step()
+        if self.g_accumulation_count >= self.accumulation_steps:
+            self.generator_optimizer.step()
+            self.generator_scheduler.step()
+            self.scheduler_l1.step(); self.lambda_l1 = self.scheduler_l1.get()
+            self.scheduler_mode_seeking.step(); self.lambda_mode_seeking = self.scheduler_mode_seeking.get()
+            self.g_accumulation_count = 0
         return GeneratorLosses(g_loss=g_loss, l1_loss=l1_loss, mode_seeking_loss=mode_seeking_loss, grad_norm=total_norm)
 
     def train_step(self, batch):
         images = batch['image'].to(self.device)
         targets = batch['target'].to(self.device)
+
+        # Switch to training mode
+        self.generator.train()
+        self.discriminator.train()
 
         # Discriminate real and fake images
         em_losses = []

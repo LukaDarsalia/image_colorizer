@@ -133,11 +133,11 @@ class UNetGenerator(nn.Module):
             activation,
         )
         self.bottleneck_film = FiLM(512, 128)
-        self.d_layer1 = UpSampleBlock(512, 256, 256, number_of_convolutions=16, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
-        self.d_layer2 = UpSampleBlock(256, 128, 128, number_of_convolutions=12, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
-        self.d_layer3 = UpSampleBlock(128, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
-        self.d_layer4 = UpSampleBlock(64, 64, 64, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
-        self.d_layer5 = UpSampleBlock(64, 0, 64, number_of_convolutions=6, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation)
+        self.d_layer1 = UpSampleBlock(512, 256, 256, number_of_convolutions=8, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
+        self.d_layer2 = UpSampleBlock(256, 128, 128, number_of_convolutions=6, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
+        self.d_layer3 = UpSampleBlock(128, 64, 64, number_of_convolutions=4, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
+        self.d_layer4 = UpSampleBlock(64, 64, 64, number_of_convolutions=4, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
+        self.d_layer5 = UpSampleBlock(64, 0, 64, number_of_convolutions=2, use_batchnorm=use_batchnorm, interpolation_mode=interpolation_mode, activation=activation, z_dim=128)
 
         # Final layer
         self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
@@ -170,9 +170,9 @@ class UNetGenerator(nn.Module):
         # Decoder path
         x = self.d_layer1(x, skip_connections[3], z)
         x = self.d_layer2(x, skip_connections[2], z)
-        x = self.d_layer3(x, skip_connections[1])
-        x = self.d_layer4(x, skip_connections[0])
-        x = self.d_layer5(x, None)
+        x = self.d_layer3(x, skip_connections[1], z)
+        x = self.d_layer4(x, skip_connections[0], z)
+        x = self.d_layer5(x, None, z)
 
         # Final convolution and activation
         x = self.final_conv(x)

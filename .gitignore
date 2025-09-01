@@ -4,6 +4,8 @@ __pycache__/
 *$py.class
 logs_test
 logs_test_v2
+data_kaggle/
+checkpoints_good/
 runs_on_big_data
 # C extensions
 *.so

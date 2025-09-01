@@ -1,11 +1,17 @@
 import torch.nn as nn
 from torch.nn.utils import spectral_norm
 
-def conv_block(in_ch, out_ch, stride, spectral=False):
+def conv_block(in_ch, out_ch, stride, spectral=False, use_groupnorm=True):
     conv = nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1, bias=not spectral)
     if spectral:
         conv = spectral_norm(conv)
+
     layers = [conv]
+
+    if use_groupnorm:
+        # Equivalent to LayerNorm across channels
+        layers += [nn.GroupNorm(32, out_ch)]
+
     layers += [nn.LeakyReLU(0.2, inplace=True)]
     return nn.Sequential(*layers)
 

@@ -158,7 +158,7 @@ if __name__ == "__main__":
     print("Target shape (color):", sample['target'].shape)
 
     # Test dataloaders
-    train_loader, val_loader = get_dataloaders('data/tiny-imagenet-200')
+    train_loader, val_loader = get_dataloaders('data_kaggle/data', image_size=400)
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     for batch_idx, batch in enumerate(train_loader):
